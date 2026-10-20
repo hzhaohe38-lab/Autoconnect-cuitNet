@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source ./b-log.sh
+source "$(dirname "${BASH_SOURCE[0]}")/b-log.sh"
 
 function log4shell(){
     # logging shell
@@ -8,15 +8,12 @@ function log4shell(){
     # 2. remove too old log file
 
 
-    str_head=`cat $log_path|head -1`
-    echo $str_head
+    str_head=`cat "$log_path" 2>/dev/null | head -1`
 
     crtime=`echo "$str_head" | awk  -F'[' '{print $3}'|tr -d '[]'`
     # echo $crtime
     crday=`echo $crtime| awk '{print $1}'`
     # echo $crday
-
-    echo 'log_path --> '$log_path
 
     # save log 
     if [ $log_save_day -gt 0 ]; then
