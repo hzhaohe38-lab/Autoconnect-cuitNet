@@ -16,3 +16,6 @@
 
 # Binary artifacts must never be converted
 *.zip  binary
+
+# Windows batch launcher
+*.bat  text eol=crlf

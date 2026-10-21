@@ -11,7 +11,8 @@
 param(
     [string]$ConfigPath,
     [string[]]$DetectUrl,
-    [int]$RetryInterval = 10,
+    [int]$RetryInterval = 5,
+    [string]$PortalUrl,
     [switch]$Once
 )
 
@@ -244,13 +245,15 @@ $service = $serviceMap[$currentNetwork]
 $serviceName = $serviceNameMap[$service]
 $network = $currentNetwork
 
-$interval = 3600
-if ($cfg.ContainsKey('timeInterval')) {
+# 在线监控间隔（秒）：默认 1 秒，插拔网线后能尽快反应
+$interval = 1
+if ($cfg.ContainsKey('monitorInterval')) {
     $tmp = 0
-    if ([int]::TryParse($cfg['timeInterval'], [ref]$tmp)) { $interval = $tmp }
+    if ([int]::TryParse($cfg['monitorInterval'], [ref]$tmp)) { $interval = $tmp }
 }
-if ($interval -lt 600) { $interval = 600 }
-if ($RetryInterval -lt 5) { $RetryInterval = 5 }
+if ($interval -lt 1) { $interval = 1 }
+if ($interval -gt 60) { $interval = 60 }
+if ($RetryInterval -lt 3) { $RetryInterval = 3 }
 
 $logPath = 'ruijie.log'
 if ($cfg.ContainsKey('log_path') -and $cfg['log_path']) { $logPath = $cfg['log_path'] }
@@ -424,8 +427,249 @@ function Test-Network {
     return [pscustomobject]@{ Online = $false; Portal = $null; Code = $null; Source = $null }
 }
 
+# ---------- 新版 SMP+ / CAS 登录 ----------
+function New-BrowserClient {
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.AllowAutoRedirect = $true
+    $handler.UseProxy = $false
+    $handler.UseCookies = $true
+    $handler.CookieContainer = New-Object System.Net.CookieContainer
+    $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    $client = New-Object System.Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(20)
+    $client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36') | Out-Null
+    $client.DefaultRequestHeaders.TryAddWithoutValidation('Accept-Language', 'zh-CN,zh;q=0.9') | Out-Null
+    return $client
+}
+
+function Get-QueryValue {
+    param([string]$Url, [string]$Name)
+    $m = [regex]::Match($Url, '[?&]' + [regex]::Escape($Name) + '=([^&]*)')
+    if ($m.Success) { return [Uri]::UnescapeDataString($m.Groups[1].Value) }
+    return $null
+}
+
+function Get-HtmlElementText {
+    param([string]$Html, [string]$Id)
+    $m = [regex]::Match($Html, 'id\s*=\s*["'']' + [regex]::Escape($Id) + '["''][^>]*>([^<]+)<', 'IgnoreCase')
+    if ($m.Success) { return [System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value).Trim() }
+    return $null
+}
+
+function Encrypt-AesEcb {
+    param([string]$KeyBase64, [string]$PlainText)
+    $key = [Convert]::FromBase64String($KeyBase64)
+    if ($key.Length -ne 16 -and $key.Length -ne 24 -and $key.Length -ne 32) {
+        throw "无效的 AES 密钥长度: $($key.Length)"
+    }
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    try {
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::ECB
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = $key
+        $enc = $aes.CreateEncryptor()
+        try {
+            $plain = [Text.Encoding]::UTF8.GetBytes($PlainText)
+            $cipher = $enc.TransformFinalBlock($plain, 0, $plain.Length)
+            return [Convert]::ToBase64String($cipher)
+        } finally { $enc.Dispose() }
+    } finally { $aes.Dispose() }
+}
+
+function Invoke-JsonPost {
+    param($Client, [string]$Url, $Body)
+    $json = $Body | ConvertTo-Json -Compress
+    $content = New-Object System.Net.Http.StringContent($json, [Text.Encoding]::UTF8, 'application/json')
+    $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $Url)
+    $origin = ([Uri]$Url).GetLeftPart([UriPartial]::Authority)
+    $req.Headers.TryAddWithoutValidation('Origin', $origin) | Out-Null
+    $req.Headers.TryAddWithoutValidation('Referer', $Url) | Out-Null
+    $req.Headers.TryAddWithoutValidation('Accept', 'application/json, text/plain, */*') | Out-Null
+    $req.Content = $content
+    $resp = $Client.SendAsync($req).GetAwaiter().GetResult()
+    $text = ''
+    if ($resp.Content) { $text = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult() }
+    return [pscustomobject]@{ Code = [int]$resp.StatusCode; Body = $text }
+}
+
+function Invoke-LoginSmp {
+    param([string]$PortalUrl)
+
+    $client = New-BrowserClient
+    try {
+        Write-Log INFO ("新版门户: 打开认证页 {0}" -f $PortalUrl)
+        $resp = $client.GetAsync($PortalUrl).GetAwaiter().GetResult()
+        $finalUrl = $resp.RequestMessage.RequestUri.AbsoluteUri
+        $html = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        Write-Log DEBUG ("门户最终地址: {0} (HTTP {1})" -f $finalUrl, [int]$resp.StatusCode)
+
+        # 找 CAS 登录 iframe
+        $iframeUrl = $null
+        $m = [regex]::Match($html, '<iframe[^>]+src\s*=\s*["'']([^"'']*cas-sso/login[^"'']*)["'']', 'IgnoreCase')
+        if ($m.Success) {
+            $iframeUrl = Resolve-PortalUrl -Raw ([System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value)) -BaseUrl $finalUrl
+        }
+        if (-not $iframeUrl) {
+            # 某些页面由 JS 动态创建 iframe，从门户地址参数拼出来
+            $sessionId = Get-QueryValue -Url $finalUrl -Name 'sessionId'
+            $customPageId = Get-QueryValue -Url $finalUrl -Name 'customPageId'
+            $nasIp = Get-QueryValue -Url $finalUrl -Name 'nasIp'
+            $userIp = Get-QueryValue -Url $finalUrl -Name 'userIp'
+            if ($sessionId -and $customPageId -and $nasIp -and $userIp) {
+                $uri = [Uri]$finalUrl
+                $timer = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                $iframeUrl = ('{0}://{1}/cas-sso/login?flowSessionId={2}&customPageId={3}&preview=false&appType=normal&language=zh-CN&timer={4}&nasIp={5}&userIp={6}' -f $uri.Scheme, $uri.Authority, $sessionId, $customPageId, $timer, $nasIp, $userIp)
+            }
+        }
+        if (-not $iframeUrl) {
+            Write-Log WARN '没有找到 CAS 登录页（不是新版 SMP+ 门户）'
+            return 'not_smp'
+        }
+        Write-Log INFO ("CAS 登录页: {0}" -f $iframeUrl)
+
+        $resp2 = $client.GetAsync($iframeUrl).GetAwaiter().GetResult()
+        $html2 = $resp2.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $croypto = Get-HtmlElementText -Html $html2 -Id 'login-croypto'
+        $execution = Get-HtmlElementText -Html $html2 -Id 'login-page-flowkey'
+        if (-not $croypto -or -not $execution) {
+            Write-Log ERROR 'CAS 登录页缺少 croypto / execution 参数'
+            return 'failed'
+        }
+        Write-Log DEBUG ("croypto={0}  execution={1}..." -f $croypto, $execution.Substring(0, [Math]::Min(24, $execution.Length)))
+
+        $action = $null
+        $fm = [regex]::Match($html2, '<form[^>]*id\s*=\s*["'']normalLoginForm["''][^>]*>', 'IgnoreCase')
+        if ($fm.Success) {
+            $am = [regex]::Match($fm.Value, 'action\s*=\s*["'']([^"'']*)["'']', 'IgnoreCase')
+            if ($am.Success) { $action = [System.Net.WebUtility]::HtmlDecode($am.Groups[1].Value) }
+        }
+        if (-not $action) { $action = $iframeUrl }
+        $action = Resolve-PortalUrl -Raw $action -BaseUrl $iframeUrl
+        if ($action -notmatch '(?i)accept-language=') {
+            if ($action.Contains('?')) { $action += '&accept-language=zh-CN' } else { $action += '?accept-language=zh-CN' }
+        }
+        Write-Log INFO ("登录接口: {0}" -f $action)
+
+        $encPassword = Encrypt-AesEcb -KeyBase64 $croypto -PlainText $password
+        $encCaptcha = Encrypt-AesEcb -KeyBase64 $croypto -PlainText '{}'
+
+        $fields = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+        $fields['username'] = $userId
+        $fields['type'] = 'UsernamePassword'
+        $fields['_eventId'] = 'submit'
+        $fields['geolocation'] = ''
+        $fields['execution'] = $execution
+        $fields['captcha_code'] = ''
+        $fields['croypto'] = $croypto
+        $fields['password'] = $encPassword
+        $fields['captcha_payload'] = $encCaptcha
+
+        $content = New-Object System.Net.Http.FormUrlEncodedContent($fields)
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $action)
+        $origin = ([Uri]$action).GetLeftPart([UriPartial]::Authority)
+        $req.Headers.TryAddWithoutValidation('Origin', $origin) | Out-Null
+        $req.Headers.TryAddWithoutValidation('Referer', $iframeUrl) | Out-Null
+        $req.Headers.TryAddWithoutValidation('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8') | Out-Null
+        $req.Content = $content
+
+        $resp3 = $client.SendAsync($req).GetAwaiter().GetResult()
+        $code = [int]$resp3.StatusCode
+        $body3 = ''
+        if ($resp3.Content) { $body3 = $resp3.Content.ReadAsStringAsync().GetAwaiter().GetResult() }
+        $finalRespUrl = $resp3.RequestMessage.RequestUri.AbsoluteUri
+        $finalPath = ([Uri]$finalRespUrl).AbsolutePath
+        Write-Log INFO ("服务器返回: HTTP {0}  {1}" -f $code, (Get-ShortText -Text $body3 -Max 200))
+        Write-Log DEBUG ("登录最终页面: {0}" -f $finalPath)
+
+        if ($code -eq 401 -or $code -eq 403) {
+            Write-Log ERROR 'CAS 返回 401/403：账号或密码错误'
+            return 'auth_failed'
+        }
+
+        # CAS 成功后，门户流程还要推进：getCurrentNode -> serviceSelection -> setService
+        $sessionId = Get-QueryValue -Url $finalUrl -Name 'sessionId'
+        if ($sessionId) {
+            $baseUri = ([Uri]$finalUrl).GetLeftPart([UriPartial]::Authority)
+            $flowKey = Get-QueryValue -Url $finalUrl -Name 'workFlowKey'
+            if (-not $flowKey) { $flowKey = 'portal_auth' }
+            $nodeUrl = "$baseUri/eportal/workFlow/getCurrentNode"
+            $nodeResp = Invoke-JsonPost -Client $client -Url $nodeUrl -Body @{ sessionId = $sessionId; flowKey = $flowKey }
+            $node = $null
+            try { $node = $nodeResp.Body | ConvertFrom-Json } catch { }
+            if ($node -and $node.code -eq 200 -and $node.data) {
+                Write-Log INFO ("流程节点: {0}" -f $node.data.currentNodePath)
+                if ($node.data.currentNodePath -eq 'serviceSelection') {
+                    Write-Log INFO '需要选择运营商，获取可选列表...'
+                    $listUrl = "$baseUri/eportal/network/serviceSelection"
+                    $listResp = Invoke-JsonPost -Client $client -Url $listUrl -Body @{ sessionId = $sessionId }
+                    $listJson = $null
+                    try { $listJson = $listResp.Body | ConvertFrom-Json } catch { }
+                    if ($listJson -and $listJson.code -eq 200 -and $listJson.data) {
+                        $list = @($listJson.data)
+                        $names = ($list | ForEach-Object { "$($_.key)($($_.value))" }) -join ', '
+                        Write-Log INFO ("可选运营商: {0}" -f $names)
+                        $svc = $list | Where-Object { "$($_.key)" -eq $serviceName -or "$($_.value)" -eq $serviceName } | Select-Object -First 1
+                        if (-not $svc) {
+                            $svc = $list | Where-Object { "$($_.key)" -match $serviceName -or "$($_.value)" -match $serviceName } | Select-Object -First 1
+                        }
+                        if ($svc) {
+                            # 流程里的服务选择使用 serviceLogin（不是 setService；后者是在线切换服务）
+                            $setUrl = "$baseUri/eportal/network/serviceLogin"
+                            $setResp = Invoke-JsonPost -Client $client -Url $setUrl -Body @{ sessionId = $sessionId; service = $svc.value }
+                            $setJson = $null
+                            try { $setJson = $setResp.Body | ConvertFrom-Json } catch { }
+                            if ($setJson -and $setJson.code -eq 200 -and $setJson.data -and $setJson.data.authResult -eq 'success') {
+                                Write-Log OK ("运营商登录成功: {0} ({1})" -f $svc.key, $svc.value)
+                                $nodeResp2 = Invoke-JsonPost -Client $client -Url $nodeUrl -Body @{ sessionId = $sessionId; flowKey = $flowKey }
+                                $node2 = $null
+                                try { $node2 = $nodeResp2.Body | ConvertFrom-Json } catch { }
+                                if ($node2 -and $node2.data) {
+                                    Write-Log INFO ("流程节点: {0}" -f $node2.data.currentNodePath)
+                                }
+                            } else {
+                                $msg = ''
+                                if ($setJson -and $setJson.data) { $msg = "$($setJson.data.message)" }
+                                Write-Log ERROR ("运营商登录失败: HTTP {0} {1}" -f $setResp.Code, (Get-ShortText -Text ($msg + ' ' + $setResp.Body) -Max 200))
+                            }
+                        } else {
+                            Write-Log ERROR ("服务列表中没有匹配到运营商: {0}" -f $serviceName)
+                        }
+                    } else {
+                        Write-Log ERROR ("获取运营商列表失败: HTTP {0} {1}" -f $listResp.Code, (Get-ShortText -Text $listResp.Body -Max 200))
+                    }
+                }
+            } else {
+                Write-Log WARN ("获取流程节点失败: HTTP {0} {1}" -f $nodeResp.Code, (Get-ShortText -Text $nodeResp.Body -Max 200))
+            }
+        }
+
+        # CAS 登录成功后，NAS 需要几秒钟才会放行网络；轮询等待，不要立刻重试登录
+        if ($finalPath -match 'auth-success') {
+            Write-Log OK 'CAS 认证成功，等待网络生效...'
+        }
+        $online = $false
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 2
+            $after = Test-Network
+            if ($after.Online) { $online = $true; break }
+            Write-Log DEBUG ("等待网络生效... ({0}/20)" -f ($i + 1))
+        }
+        if ($online) {
+            Write-Log OK '登录成功，网络已恢复'
+            return 'success'
+        }
+        Write-Log ERROR '登录请求已发送，但网络仍未恢复'
+        return 'failed'
+    } catch {
+        Write-Log ERROR ("新版门户登录失败: {0}" -f $_.Exception.Message)
+        return 'failed'
+    } finally {
+        $client.Dispose()
+    }
+}
+
 # ---------- 登录 ----------
-function Invoke-Login {
+function Invoke-LoginLegacy {
     param([string]$PortalUrl)
 
     $q = ''
@@ -509,44 +753,63 @@ Write-Host '=========================================' -ForegroundColor Cyan
 Write-Log INFO ("配置文件: {0}" -f $ConfigPath)
 Write-Log INFO ("日志文件: {0}" -f $LogFile)
 Write-Log INFO ("账号: {0}    运营商: {1} ({2})" -f $userId, $serviceName, $service)
-Write-Log INFO ("在线检测间隔: {0} 秒    失败重试间隔: {1} 秒" -f $interval, $RetryInterval)
+Write-Log INFO ("在线监控间隔: {0} 秒    失败重试间隔: {1} 秒" -f $interval, $RetryInterval)
 Write-Log INFO ("检测地址: {0}" -f ($DetectUrls -join ', '))
 Write-Host '=========================================' -ForegroundColor Cyan
 Write-Host ''
 
+if ($PortalUrl) {
+    Write-NetworkInfo
+    $status = Invoke-LoginSmp -PortalUrl $PortalUrl
+    if ($status -eq 'not_smp') {
+        if (Invoke-LoginLegacy -PortalUrl $PortalUrl) { $status = 'success' } else { $status = 'failed' }
+    }
+    if ($status -eq 'success') { exit 0 } else { exit 1 }
+}
+
 $exitCode = 0
+$lastOnline = $null
 while ($true) {
     Write-NetworkInfo
     $state = Test-Network
 
     if ($state.Online) {
-        Write-Log OK ("已在线 (HTTP 204, 检测: {0})" -f $state.Source)
+        if ($lastOnline -ne $true) {
+            Write-Log OK ("已在线 (HTTP 204, 检测: {0})，开始监控..." -f $state.Source)
+            $lastOnline = $true
+        }
         if ($Once) { break }
-        Write-Log INFO ("下次检测: {0} 秒后" -f $interval)
         Start-Sleep -Seconds $interval
         continue
     }
 
+    $lastOnline = $false
     if (-not $state.Portal) {
-        Write-Log WARN ("没有获取到认证页地址（检测地址均不可达），{0} 秒后重试" -f $RetryInterval)
+        Write-Log WARN ("网络不可达，{0} 秒后重试" -f $RetryInterval)
         if ($Once) { $exitCode = 1; break }
         Start-Sleep -Seconds $RetryInterval
         continue
     }
 
-    Write-Log WARN ("未登录 (HTTP {0})，准备登录" -f $state.Code)
-    $ok = Invoke-Login -PortalUrl $state.Portal
-    if ($ok) { $exitCode = 0 } else { $exitCode = 1 }
+    Write-Log WARN ("未登录 (HTTP {0})，开始自动登录..." -f $state.Code)
+    $smp = Invoke-LoginSmp -PortalUrl $state.Portal
+    $ok = $false
+    if ($smp -eq 'success') {
+        $ok = $true
+    } elseif ($smp -eq 'not_smp') {
+        Write-Log WARN '回退到旧版锐捷 ePortal 接口...'
+        $ok = Invoke-LoginLegacy -PortalUrl $state.Portal
+    }
+    if ($ok) {
+        $exitCode = 0
+        Write-Log OK '登录完成，继续监控...'
+    } else {
+        $exitCode = 1
+        Write-Log WARN ("登录失败，{0} 秒后重试" -f $RetryInterval)
+    }
 
     if ($Once) { break }
-
-    if ($ok) {
-        Write-Log INFO ("下次检测: {0} 秒后" -f $interval)
-        Start-Sleep -Seconds $interval
-    } else {
-        Write-Log WARN ("{0} 秒后重试" -f $RetryInterval)
-        Start-Sleep -Seconds $RetryInterval
-    }
+    if (-not $ok) { Start-Sleep -Seconds $RetryInterval }
 }
 
 exit $exitCode

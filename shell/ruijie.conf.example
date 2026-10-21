@@ -7,8 +7,10 @@
 userId=
 # user password (must specific)
 password=
-# relogin time interval (seconds)
+# relogin time interval (shell version)
 timeInterval=3600
+# online monitor interval (seconds) - PowerShell version
+monitorInterval=1
 
 # log save path (relative to this file)
 log_path=./ruijie.log
